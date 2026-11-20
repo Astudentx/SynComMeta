@@ -49,3 +49,6 @@ venv/
 .codex/
 .aws/
 SynCom-MetaFlow_项目总提示词.md
+
+# Local development tests
+/tests/
