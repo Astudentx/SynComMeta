@@ -1,0 +1,6 @@
+fastp	fastp
+bwa	bwa
+samtools	samtools
+motus	motus
+featureCounts	featureCounts
+bcftools	bcftools
