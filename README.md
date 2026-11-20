@@ -1,83 +1,271 @@
 # SynCom-MetaFlow
 
-SynCom-MetaFlow 接收双端 FASTQ、样本 TSV、SynComDB 目录和模块列表，生成可直接执行的 Bash 脚本。支持 M01–M06 独立运行、自动加入依赖、分批处理及合并。
+**A modular, reference-based workflow for paired-end synthetic community metagenomics.**
 
-## Python 主控与分析目录
+**English** · [简体中文](README.zh-CN.md)
 
-Python 入口 `syncom-metaflow` 调用 `syncom/cli.py` 解析样本、校验参考和工具、选择依赖并生成样本级任务。执行模式共用同一份计划。运行 `./syncom-metaflow modules` 可列出六个模块。模块的工具命令定义在 `syncom/modules/`，包括功能定量 `m04.py`、SNV `m05.py` 和基因 PAV/CNV `m06.py`。
+From paired-end reads to taxonomic profiles, reference-strain coverage, gene and functional abundance, single-nucleotide variants, and gene presence/absence and relative copy number. Choose the modules you need, inspect the generated Bash jobs, and run or resume them in your own analysis directory.
 
-`--outdir` 接受用户指定的分析目录。每个目录下的 `shell/` 指向该次计划快照，含可直接执行的 `run_all.sh`、每样本任务、命令定义、配置和输入清单。单样本片段由总控脚本加载，共用锁、缓存和日志。实际分析结果与 `shell/` 同级。历史命令中的 `scripts/` 为兼容入口。
+> **Before you start:** this repository contains core code and configuration examples. Reference databases, sequencing data, analysis results, and development test files are excluded. Prepare a compatible database and install the tools required by your selected modules.
 
-## 代码与数据范围
+[Workflow](#workflow) · [Modules](#modules) · [Quick start](#quick-start) · [Inputs](#inputs) · [Outputs](#outputs) · [Interpretation](#interpretation-and-defaults)
 
-本仓库仅提供核心程序、数据库资产构建脚本、示例样本表和工具配置。数据库、参考序列、测序数据、分析结果、开发测试脚本以及开发提示词不随代码发布。下文的 `db/SynCom122/` 指开发环境中的本地数据库，使用前须自行准备兼容的数据库目录和软件。Python 主程序仅使用标准库；运行环境为 Linux、Python 3.10 或以上版本及 Bash。
+## Workflow
 
-## 运行
-
-在项目目录中运行以下命令。将 `/path/to/samples.tsv` 替换为本批实验样本表。
-
-```bash
-./syncom-metaflow doctor
-./syncom-metaflow run --samples /path/to/samples.tsv --db db/SynCom122 \
-  --modules M01,M02,M03,M04,M05,M06 --threads 4 --outdir results/batch01
+```mermaid
+flowchart TD
+    A[Paired-end FASTQ + sample TSV] --> B{Raw or cleaned reads?}
+    B -->|Raw| C[M01 · Read QC]
+    B -->|Already cleaned| D[Clean paired-end reads]
+    C --> D
+    D --> E[M02 · Taxonomic profiling]
+    D --> F[Shared reference alignment]
+    R[User-supplied reference database] -.-> E
+    R -.-> F
+    F --> G[M03 · Strain coverage]
+    F --> H[M04 · Gene and functional abundance]
+    G --> I[Coverage and reference-group screening]
+    I --> J[M05 · SNVs and callable regions]
+    I --> K[M06 · Gene PAV and relative CNV]
+    E --> L[Per-sample results + summary tables]
+    G --> L
+    H --> L
+    J --> L
+    K --> L
 ```
 
-也可生成脚本后后台启动。
+The Python controller validates inputs, resolves module dependencies, and writes a Bash execution plan. `plan` exports that plan; `run` exports and executes it. Samples currently run sequentially, with threading inside individual tools. M03 and M04 share a sorted reference-alignment BAM. During alignment, BWA and sorting overlap and each needs at least one core; allocate at least two cores even if `--threads 1` is requested.
+
+## Modules
+
+| Module | Analysis | Main tools | Main summary outputs |
+|---|---|---|---|
+| **M01** | Paired-end read QC | fastp | `qc.tsv` |
+| **M02** | Taxonomic profiling | mOTUs, BWA | `taxonomy.tsv`, `taxonomy_matrix.tsv` |
+| **M03** | Reference-strain and near-identical-group coverage | BWA, samtools | `strains.tsv`, `strains_matrix.tsv`, `strain_groups_matrix.tsv` |
+| **M04** | Gene and annotated-function abundance | BWA, samtools, featureCounts | `genes.tsv`, `functions.tsv`, gene/function FPKM matrices |
+| **M05** | Population SNVs and callable regions | M03 dependencies, bcftools | `snv.tsv`, `snv_eligibility.tsv` |
+| **M06** | Gene presence/absence and relative copy number | M03 dependencies | `pav_cnv.tsv`, gene PAV/CNV matrices, `pav_cnv_eligibility.tsv` |
+
+**Dependencies:** raw-read input automatically adds M01. M05 or M06 automatically adds M03. Use `--clean-reads` to bypass QC for samples that already have exactly one cleaned FASTQ pair; do not combine it with M01.
+
+## Quick start
+
+### 1. Get the code and configure tools
+
+Use Linux, Python 3.10+ (the development environment uses Python 3.12), Bash, GNU command-line utilities, and `flock`. The Python controller uses the standard library.
 
 ```bash
-./syncom-metaflow plan --samples /path/to/samples.tsv --db db/SynCom122 \
-  --modules M01,M02,M03,M04,M05,M06 --threads 4 --outdir results/batch01
-nohup bash results/batch01/shell/run_all.sh > results/batch01/run.log 2>&1 &
+git clone https://github.com/Astudentx/SynComMeta.git
+cd SynComMeta
+
+# Edit the right column to use commands on PATH or executable paths.
+cp config/tools.example.tsv config/tools.local.tsv
+./syncom-metaflow doctor --tools config/tools.local.tsv
+./syncom-metaflow modules
 ```
 
-`run` 与 `plan` 生成相同的脚本结构。输出目录里的 `shell/run_all.sh` 可以从任意工作目录调用。它读取同目录的样本路径、参数和模块脚本，在 Linux 上直接调用配置好的分析程序。HPC 作业可运行同一个入口，当前按样本串行执行。比对阶段同时运行 BWA 和排序，两个进程至少各占一个核。
+`doctor` checks executable discovery for all six modules; it does not validate a database or run a full analysis. A `plan` or `run` command checks tools for its selected modules and dependencies. See [software configuration](#software-configuration) if you only need a subset.
 
-原始 reads 默认经过 M01。只做质控可指定 `--modules M01`。只有一对已清洗 FASTQ 的样本可用 `--clean-reads --modules M02,M03` 直接分析。输入格式见 `examples/samples.tsv`。TSV 必须有 `sample_id`、`r1` 和 `r2`，路径相对于样本表所在目录解析。多 lane 样本须为每行填写唯一的 `lane_id`，按样本表行序合并后质控。分组、对照和接种组合等额外列保存在运行快照中。
+### 2. Prepare your inputs
 
-## 软件与数据库
+Prepare a tab-separated sample sheet and a compatible database directory containing `manifest.tsv`. Replace `/path/to/samples.tsv` and `/path/to/SynComDB` below with your real paths. See [Inputs](#inputs) for the required formats.
 
-公开仓库中的 `config/tools.tsv` 使用 PATH 中的通用命令名。已在原开发环境验证的软件包括 fastp 0.23.1、BWA 0.7.17、samtools 1.20、featureCounts 1.6.3、bcftools 1.19 和已有的 mOTUs 环境。换机器时可用 `--tools /path/to/tools.tsv` 指定另一张两列 TSV，左列是工具名，右列是可执行路径或 PATH 中的命令。软件是否能被定位可由 `doctor` 检查，实际版本写入每次运行的 `provenance/versions.tsv`。
+### 3. Run the full workflow
 
-共享 mOTUs 环境用个性化库运行时报告 `3.0.1_NEWDB`，这是该运行输出的版本标记。库中包含 `ref_mOTU_v31_*` 及 `NEWDB_*` 条目。已经用现有库完成测试。更换 mOTUs 软件或数据库前应另做兼容性验证。
+```bash
+./syncom-metaflow run \
+  --samples /path/to/samples.tsv \
+  --db /path/to/SynComDB \
+  --tools config/tools.local.tsv \
+  --modules M01,M02,M03,M04,M05,M06 \
+  --threads 4 \
+  --outdir results/batch01
+```
 
-`db/SynCom122/manifest.tsv` 引用已有的 BWA FASTA、索引、contig 映射与 mOTUs 数据库。清单中的相对路径以清单目录为基准。菌株表 `strains.tsv` 来自用户提供的工作簿，工作表和源文件校验和记在 `strains.source.tsv`。122 个元数据 ID 与参考映射一一对应。运行前检查 contig 名称、长度及菌株元数据的连接。
+Start with `results/batch01/summary/` for combined tables and `results/batch01/provenance/status.tsv` for run completion.
 
-现有 GFF、CDS 和蛋白 FASTA 的路径见 `db/SynCom122/sequence_sources.tsv`。从 GFF 取 CDS 坐标后，按链方向从联合参考取序列，并与原 FFN 逐条比较。122 个基因组的 569,717 条 CDS 均已通过。派生的 SAF、BED、基因映射和 GO、COG/KOG、KEGG KO、CAZy、Pfam 注释表位于 `db/SynCom122/gene_assets/`，包含 7,361,788 条基因–功能映射。每株的导入计数在 `import_report.tsv`，被排除的记录写入 `rejected_cds.tsv`。如需从新的源文件重建，可在新目录运行 `python3 scripts/build_gene_assets.py --help` 查看参数。
+### 4. Or export jobs for later execution
 
-## 结果与续跑
+```bash
+./syncom-metaflow plan \
+  --samples /path/to/samples.tsv \
+  --db /path/to/SynComDB \
+  --tools config/tools.local.tsv \
+  --modules M01,M02,M03,M04,M05,M06 \
+  --threads 4 \
+  --outdir results/batch01
 
-矩阵以实体为行、样本为列。主要汇总文件都在 `results/<batch>/summary/`。
+nohup bash results/batch01/shell/run_all.sh \
+  > results/batch01/run.log 2>&1 &
+```
 
-| 模块 | 汇总结果 | 单样本产物 |
+The generated `shell/run_all.sh` can be called from any working directory using its absolute path. You can also invoke it from an HPC batch job; scheduler submission is managed separately. Plans retain paths to reads, databases, and executables, so those resources must remain accessible.
+
+## Inputs
+
+### Sample sheet
+
+Use a **TSV file with a header**, as in [examples/samples.tsv](examples/samples.tsv):
+
+```tsv
+sample_id	r1	r2	lane_id
+sample01	reads/sample01_L001_R1.fastq.gz	reads/sample01_L001_R2.fastq.gz	L001
+sample01	reads/sample01_L002_R1.fastq.gz	reads/sample01_L002_R2.fastq.gz	L002
+sample02	reads/sample02_L001_R1.fastq.gz	reads/sample02_L001_R2.fastq.gz	L001
+```
+
+| Field | Required | Meaning |
 |---|---|---|
-| M01 | `qc.tsv`，含输入和清洗后的配对数 | `qc/<sample>/` 下的 clean FASTQ、fastp JSON 与 HTML |
-| M02 | `taxonomy.tsv`、`taxonomy_matrix.tsv` | `taxonomy/<sample>/` 下的原始 mOTUs 表和标准长表 |
-| M03 | `strains.tsv`、`strains_matrix.tsv`、菌株组长表及矩阵 | `strains/<sample>/` 下的 contig 覆盖及基因组统计 |
-| M04 | `genes.tsv`、`functions.tsv`、`gene_fpkm_matrix.tsv`、`function_fpkm_matrix.tsv` | `functions/<sample>/` 下的原始 featureCounts 计数与汇总 |
-| M05 | `snv.tsv`、`snv_eligibility.tsv` | `snv/<sample>/` 下的可调用区间 BED、SNV 和参考筛选状态 |
-| M06 | `pav_cnv.tsv`、`gene_pav_matrix.tsv`、`gene_cnv_matrix.tsv`、`pav_cnv_eligibility.tsv` | `pav_cnv/<sample>/` 下的逐基因覆盖、状态和相对拷贝数 |
+| `sample_id` | Yes | Sample identifier: starts with a letter or digit; contains letters, digits, `_`, `.`, or `-` |
+| `r1`, `r2` | Yes | Mate FASTQ paths; relative paths resolve against the sample sheet directory |
+| `lane_id` | For multiple lanes | Unique within each sample; lanes are concatenated in row order before QC |
+| Other columns | No | Group, control, or inoculation metadata, preserved in the input snapshot |
 
-M02 使用 mOTUs 原始相对丰度。个性化库若重复输出相同的 `unassigned`，标准表只取一次，无标记信号时原工具可能输出全零。
+For a single lane, `lane_id` may be omitted. With `--clean-reads`, provide exactly one FASTQ pair per sample. The example sheet illustrates the format; its read files are not bundled.
 
-M03、M04 共用 `work/<sample>/alignment/` 下的联合参考排序 BAM 和 BAI。M03 的 `reads_mapq20` 是 MAPQ ≥ 20 的读段数。平均深度按 contig 长度加权。`target_depth_fraction` 是单个参考的平均深度占所有目标参考平均深度之和的比例，全库无覆盖时为 `NA`。组级矩阵按菌株表中的 ANI ≥99.99% 分组汇总高 MAPQ 证据。多重比对 reads 不参与分配，组级数值只反映可用的高置信证据。
+### Reference database
 
-M04 在联合参考上用符合比对条件的双端片段计数。FPKM 分母为样本全部 clean read pairs，长度为参考 CDS 长度。功能表按注释源和条目把对应基因的 FPKM 相加。一条基因可进入多个功能条目，因此不同条目之和可能超过基因丰度总和。
+`--db` points to a directory containing a **two-column, headerless** `manifest.tsv`. Paths resolve relative to that directory; absolute paths also work.
 
-M05、M06 自动加入 M03。默认要求参考基因组覆盖广度 ≥0.5、平均深度 ≥5，并排除元数据中属于多成员 ANI ≥99.99% 组的参考。可通过 `--min-genome-depth` 和 `--min-genome-breadth` 调整参考筛选门槛。自建库无 ANI 列时只根据覆盖筛选。
-
-- M05 用 bcftools pileup 统计高质量碱基，不进行二倍体基因型推断。位点深度至少 5，ALT 至少 3 个碱基、正反链各至少 1 个，频率至少 5%。`snv.tsv` 使用 1 基坐标，`callable.bed` 使用 0 基半开区间。空变异表应与可调用区间和筛选状态一起查看。
-- M06 使用基因与参考基因组的平均深度比估计相对拷贝数。基因广度 ≥80% 且深度 ≥1 判为 `present`。参考基因组平均深度 ≥10 且基因完全无覆盖时判为 `absent`。其余为 `uncertain`，拷贝数为 `NA`。这是参考基因层面的估计，覆盖不均、参考差异和背景近缘菌会影响判定。
-
-使用原命令或重新执行 `shell/run_all.sh` 可续跑。脚本核对输入标识、数据库、参数、软件和产物后重跑受影响任务。每项任务有独立日志。以 `provenance/status.tsv` 为准读取完成批次，`provenance/summary_catalog.tsv` 列出该次运行发布的结果。
-
-## 合并批次
-
-```bash
-./syncom-metaflow merge --outdir results/combined results/batch01 results/batch02
+```tsv
+db_version	my_syncom_v1
+reference	reference.fa
+contig_map	contig_map.tsv
+motus_db	motus_db
+genes_saf	gene_assets/genes.saf
+genes_bed	gene_assets/genes.bed
+annotations	gene_assets/annotations.tsv
+strains	strains.tsv
 ```
 
-合并校验运行状态、数据库文件标识、软件版本、模块和参数。样本 ID 必须跨批次唯一，输出目录须为新目录。合并从批次长表重新生成矩阵，并记录样本来源。单样本 BAM、日志和可调用区间保留在原批次。
+This is a schema example, not a downloadable database. Include the entries needed by your selected modules:
 
-## 验证范围
+| Entry | Used by | Requirement |
+|---|---|---|
+| `db_version` | All runs | Nonempty version identifier using letters, digits, `_`, `.`, or `-` |
+| `reference` | M03–M06 | Combined FASTA with BWA indexes (`.amb`, `.ann`, `.bwt`, `.pac`, `.sa`) and samtools `.fai` |
+| `contig_map` | M03–M06 | TSV with `contig_id`, `genome_id`, `original_contig_id`, `length_bp`; names and lengths must match the FASTA index |
+| `motus_db` | M02 | Compatible mOTUs database directory containing `db_mOTU_versions` |
+| `genes_saf` | M04 | SAF gene coordinates matching the combined reference |
+| `annotations` | M04 | TSV with `gene_id`, `source`, `function_id` |
+| `genes_bed` | M06 | Headerless BED: contig, start, end, gene ID, genome ID; coordinates are 0-based, half-open |
+| `strains` | Optional | TSV with `ID` and nonempty `strain_id`; IDs must match reference genomes. `ANI >= 99.99 Group` enables near-identical-reference grouping |
 
-开发环境中的本地测试已核对多 lane、带空格的路径、前台与后台一致性、BAI 缺失后的续跑、已知 SNV、功能计数、基因存在与缺失、低覆盖跳过和跨批合并。测试脚本不随公开代码发布。现有 SynCom122 全库和个性化 mOTUs 库也用模拟 reads 做过六模块联测。正式样本需要环境对照验证污染背景、菌株可区分性和检测限。
+M05/M06 inherit the reference requirements through M03. Reference names, gene IDs, coordinates, and annotation IDs must agree across files.
+
+`scripts/build_gene_assets.py` imports CDS coordinates and existing annotations from the source layout expected by the script, verifies CDS sequences against the combined reference, and writes gene assets and import reports. It is not a general database downloader or annotation pipeline:
+
+```bash
+python3 scripts/build_gene_assets.py --help
+```
+
+### Software configuration
+
+The public [config/tools.tsv](config/tools.tsv) and [config/tools.example.tsv](config/tools.example.tsv) use commands on `PATH`. A custom configuration uses the same **two-column, headerless TSV** format:
+
+```tsv
+fastp	fastp
+bwa	bwa
+samtools	samtools
+motus	motus
+featureCounts	featureCounts
+bcftools	bcftools
+```
+
+The right column can instead contain executable paths. Relative executable paths resolve against the configuration directory. Pass your file with `--tools`; otherwise the program uses `config/tools.tsv`.
+
+The original development environment used fastp 0.23.1, BWA 0.7.17, samtools 1.20, featureCounts 1.6.3, bcftools 1.19, and a customized mOTUs setup reporting `3.0.1_NEWDB`. This records the tested environment, not a guarantee of compatibility with every version or database. Actual tool versions are recorded per run.
+
+## Common commands
+
+| Task | Arguments for `run` or `plan` |
+|---|---|
+| QC only | `--modules M01` |
+| Strain coverage from raw reads | `--modules M03` (adds M01) |
+| Taxonomy and strain coverage from cleaned reads | `--clean-reads --modules M02,M03` |
+| Gene and function abundance | `--modules M04` (adds M01) |
+| SNVs and gene PAV/CNV | `--modules M05,M06` (adds M01 and M03) |
+
+Each command still needs `--samples`, `--db`, and `--outdir`, plus a suitable tool configuration. To change genome screening thresholds for M05/M06, add `--min-genome-depth 5 --min-genome-breadth 0.5` with your chosen values.
+
+### Resume a run
+
+```bash
+bash results/batch01/shell/run_all.sh
+```
+
+Reusing the original `run` command also supports resumption. The workflow checks recorded input identities, database information, parameters, tools, and expected products to reuse valid tasks and rerun affected tasks. Task logs are kept separately. `shell/` points to the current plan snapshot; `scripts/` is a compatibility alias.
+
+### Merge completed batches
+
+```bash
+./syncom-metaflow merge \
+  --outdir results/combined \
+  results/batch01 results/batch02
+```
+
+Batches must be complete and compatible in database identity, tool versions, modules, and parameters. Sample IDs must be unique across batches, and the merge output directory must be new. The merge rebuilds summary matrices from long tables and records sample origins; sample BAMs, logs, and callable intervals remain in the original batches.
+
+## Outputs
+
+```text
+results/batch01/
+├── shell/                 # Current execution plan: run_all.sh, jobs, settings, inputs
+├── summary/               # Combined long tables and entity-by-sample matrices
+├── qc/                    # M01: clean reads, fastp JSON and HTML
+├── taxonomy/              # M02: raw mOTUs output and standardized tables
+├── strains/               # M03: contig, genome and reference-group coverage
+├── functions/             # M04: featureCounts output and abundance tables
+├── snv/                   # M05: SNVs, callable BED and eligibility tables
+├── pav_cnv/               # M06: gene coverage, PAV/CNV and eligibility tables
+├── work/                  # Shared alignments and intermediate files
+├── logs/                  # Per-task execution logs
+└── provenance/            # Completion status, tool versions and summary catalog
+```
+
+Directories and tables depend on the selected modules. Matrix rows are entities and columns are samples. Key files in `summary/` include:
+
+| Question | Files to inspect |
+|---|---|
+| How many read pairs passed QC? | `qc.tsv` |
+| What taxa were detected? | `taxonomy.tsv`, `taxonomy_matrix.tsv` |
+| How well are reference strains covered? | `strains.tsv`, `strains_matrix.tsv`, `strain_groups.tsv`, `strain_groups_matrix.tsv` |
+| What genes and functions are abundant? | `genes.tsv`, `functions.tsv`, `gene_fpkm_matrix.tsv`, `function_fpkm_matrix.tsv` |
+| Which SNVs passed filtering? | `snv.tsv`, `snv_eligibility.tsv`; inspect per-sample `callable.bed` alongside them |
+| Which genes are present, absent, or uncertain? | `pav_cnv.tsv`, `gene_pav_matrix.tsv`, `gene_cnv_matrix.tsv`, `pav_cnv_eligibility.tsv` |
+
+Use `provenance/status.tsv` to establish completion, `provenance/versions.tsv` for tool versions, and `provenance/summary_catalog.tsv` for the summaries published by that run.
+
+## Interpretation and defaults
+
+| Analysis | Definition and interpretation |
+|---|---|
+| **M02 taxonomy** | Uses mOTUs relative abundance. Identical repeated `unassigned` entries in the customized database are retained once in standardized output. No marker signal may produce all-zero profiles. |
+| **M03 strain coverage** | `reads_mapq20` counts reads with MAPQ ≥20. Mean depth is contig-length weighted. `target_depth_fraction` is a reference's mean depth divided by the sum across target references; it is `NA` if all targets have zero coverage. It is not a direct cell-count estimate. |
+| **M03 strain groups** | Aggregates high-MAPQ evidence using supplied ANI ≥99.99% group metadata. Multimapping reads are not redistributed; group estimates reflect the available high-confidence evidence. |
+| **M04 abundance** | Counts qualifying paired-end fragments on the combined reference. FPKM uses all cleaned read pairs as the library denominator and reference CDS length. Function abundance sums gene FPKM within each annotation source and term; overlapping annotations mean totals across terms need not equal total gene abundance. |
+| **M05/M06 eligibility** | Requires genome breadth ≥0.5 and mean depth ≥5 by default, and excludes references in multi-member ANI ≥99.99% groups when metadata is supplied. Without that grouping column, screening uses coverage only. |
+| **M05 SNVs** | Uses bcftools pileup evidence, without diploid genotype inference. Requires site depth ≥5, ≥3 ALT bases, ≥1 ALT base on each strand, and ALT frequency ≥5%. `snv.tsv` uses 1-based positions; `callable.bed` uses 0-based, half-open intervals. An empty SNV table must be interpreted with callable regions and eligibility status. |
+| **M06 PAV/CNV** | `present`: gene breadth ≥80% and depth ≥1. `absent`: genome mean depth ≥10 and no gene coverage. Other cases are `uncertain`, with copy number `NA`. Relative copy number is gene mean depth divided by reference-genome mean depth. |
+
+Development checks covered multi-lane input, paths containing spaces, exported versus direct execution, resumption after a missing BAM index, known synthetic SNVs, gene/function counting, PAV/CNV, low-coverage screening, and batch merging. A local 122-reference SynCom database and customized mOTUs database were also exercised with simulated reads. These development data and tests are not distributed here. Interpretation of experimental samples requires appropriate controls for contamination, reference distinguishability, and detection limits; uneven coverage and related background organisms can affect gene-level estimates.
+
+## Repository layout
+
+```text
+SynComMeta/
+├── syncom-metaflow          # Command-line entry point
+├── syncom/
+│   ├── cli.py              # Input validation, dependencies and plan generation
+│   ├── modules/            # M01–M06 and shared alignment/coverage commands
+│   └── *.bash              # Runtime, summary tables and batch merging
+├── scripts/
+│   └── build_gene_assets.py
+├── config/                 # Portable tool configuration and example
+├── examples/               # Sample-sheet format
+├── README.md               # English documentation
+└── README.zh-CN.md          # Corresponding Chinese documentation
+```
+
+Databases, raw reads, results, caches, local configuration overrides, development prompts, and test files are excluded from publication.
