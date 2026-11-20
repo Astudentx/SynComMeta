@@ -1,0 +1,51 @@
+# Local databases, input data and generated results
+/db/
+/database/
+/databases/
+/data/
+/reads/
+/results/
+/work/
+/logs/
+
+# Sequencing, reference, alignment and index files
+*.fa
+*.fasta
+*.fna
+*.ffn
+*.faa
+*.fq
+*.fastq
+*.gz
+*.bam
+*.bai
+*.sam
+*.cram
+*.crai
+*.vcf
+*.bcf
+*.tbi
+*.csi
+*.amb
+*.ann
+*.bwt
+*.pac
+*.sa
+*.fai
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Local configuration and development files
+.env
+.env.*
+!.env.example
+*.local.tsv
+.agents/
+.codex/
+.aws/
+SynCom-MetaFlow_项目总提示词.md
